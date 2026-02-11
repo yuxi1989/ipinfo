@@ -27,7 +27,7 @@ This repo can auto-sync the formula in `yuxi1989/homebrew-ipcn` when a tag is pu
 
 Required GitHub repository secret in this repo:
 
-- `HOMEBREW_TAP_GITHUB_TOKEN`: token with push access to `yuxi1989/homebrew-ipcn`
+- `HOMEBREW_TAP_GITHUB_TOKEN` (recommended) or `TOKEN`: token with push access to `yuxi1989/homebrew-ipcn`
 
 Optional GitHub repository variable in this repo:
 
