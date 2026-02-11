@@ -36,7 +36,7 @@ Related project: [homebrew-ipcn](https://github.com/yuxi1989/homebrew-ipcn)
 ## Release
 
 ```bash
-git tag v0.2.0
+git tag v0.2.5
 git push --tags
 ```
 
