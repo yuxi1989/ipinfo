@@ -18,6 +18,11 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Resolve tag
         id: vars
         env:
@@ -42,6 +47,23 @@ jobs:
           esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "src_repo=${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release includes ipcn changes
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prev_tag="$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n 1 || true)"
+          if [ -z "${prev_tag:-}" ]; then
+            echo "No previous version tag found, skip validation."
+            exit 0
+          fi
+
+          if git diff --quiet "${prev_tag}..${TAG}" -- ipcn; then
+            echo "Tag ${TAG} does not include changes to ipcn (compared with ${prev_tag})." >&2
+            echo "Refuse release to avoid empty Homebrew sync." >&2
+            exit 1
+          fi
 
       - name: Download source tarball and compute sha256
         id: digest

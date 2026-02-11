@@ -36,3 +36,7 @@ Optional GitHub repository variable in this repo:
 Workflow file:
 
 - `.github/workflows/sync-homebrew.yml`
+
+Release guard:
+
+- Tag sync fails if `ipcn` has no changes compared with the previous `v*` tag.
