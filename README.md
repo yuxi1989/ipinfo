@@ -2,6 +2,10 @@
 
 A tiny CLI to query IP/domain geolocation and ASN details.
 
+一个轻量的命令行工具，用于查询 IP/域名的地理位置、运营商和 ASN/BGP 信息。
+
+Related project: [homebrew-ipcn](https://github.com/yuxi1989/homebrew-ipcn)
+
 ## Usage
 
 ```bash
