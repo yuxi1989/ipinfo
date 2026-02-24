@@ -13,6 +13,8 @@ Related project: [homebrew-ipcn](https://github.com/yuxi1989/homebrew-ipcn)
 ./ipcn example.com
 ./ipcn --all-ips example.com
 ./ipcn --ipv6 --json example.com
+./ipcn --lang en --fields ip,country,asn 8.8.8.8
+./ipcn --timeout 6 --retries 2 example.com
 ./ipcn -f targets.txt
 ```
 
@@ -20,6 +22,10 @@ Related project: [homebrew-ipcn](https://github.com/yuxi1989/homebrew-ipcn)
 
 - `-v, --version`: show version
 - `-h, --help`: show help
+- `--lang <zh|en>`: output language (default: auto-detect from system locale)
+- `--timeout <sec>`: request timeout seconds (default `10`)
+- `--retries <n>`: retry count for API requests (default `1`)
+- `--fields <list>`: comma-separated output fields, e.g. `ip,country,asn`
 - `--json`: output JSON array
 - `-f, --file <path>`: read query targets from file
 - `--all-ips`: for domain, query all resolved A/AAAA records

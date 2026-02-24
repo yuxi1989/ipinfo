@@ -33,6 +33,10 @@ Usage: ipcn [options] <IP-or-domain> [more targets...]
 Options:
   -v, --version     Show version
   -h, --help        Show help
+  --lang LANG       Output language: zh or en (default: auto)
+  --timeout SEC     Request timeout seconds (default: 10)
+  --retries N       Retry count for API requests (default: 1)
+  --fields LIST     Comma-separated output fields
   --json            Output JSON array
   -f, --file FILE   Read targets from file (one per line)
   --all-ips         For domains, query all resolved A/AAAA records
@@ -44,6 +48,8 @@ Examples:
   ipcn example.com
   ipcn --all-ips example.com
   ipcn --ipv6 --json example.com
+  ipcn --lang en --fields ip,country,asn 8.8.8.8
+  ipcn --timeout 6 --retries 2 example.com
   ipcn -f targets.txt
 USAGE
 }
@@ -111,14 +117,119 @@ resolve_domain_ips() {
   fi
 }
 
+detect_lang() {
+  local locale
+  locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+  case "$locale" in
+    zh*|ZH*)
+      echo "zh"
+      ;;
+    *)
+      echo "en"
+      ;;
+  esac
+}
+
+field_label() {
+  local key="$1"
+  if [[ "$OUTPUT_LANG" == "en" ]]; then
+    case "$key" in
+      input) echo "Input" ;;
+      domain) echo "Domain" ;;
+      ip) echo "IP" ;;
+      country) echo "Country" ;;
+      region) echo "Region" ;;
+      city) echo "City" ;;
+      is_cn) echo "CN Network" ;;
+      isp) echo "ISP" ;;
+      org) echo "Organization" ;;
+      as_text) echo "AS Text" ;;
+      asn) echo "ASN" ;;
+      bgp_prefix) echo "BGP Prefix" ;;
+      bgp_cc) echo "BGP CC" ;;
+      *) echo "$key" ;;
+    esac
+  else
+    case "$key" in
+      input) echo "输入" ;;
+      domain) echo "域名" ;;
+      ip) echo "IP" ;;
+      country) echo "国家" ;;
+      region) echo "省份" ;;
+      city) echo "城市" ;;
+      is_cn) echo "是否国内" ;;
+      isp) echo "ISP" ;;
+      org) echo "组织" ;;
+      as_text) echo "AS(文本)" ;;
+      asn) echo "ASN" ;;
+      bgp_prefix) echo "BGP前缀" ;;
+      bgp_cc) echo "BGP国家" ;;
+      *) echo "$key" ;;
+    esac
+  fi
+}
+
+is_valid_field() {
+  case "$1" in
+    input|domain|ip|country|region|city|is_cn|isp|org|as_text|asn|bgp_prefix|bgp_cc|error) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+normalize_fields() {
+  local raw="$1"
+  local item
+  local clean
+  local out=""
+  local IFS=','
+  read -r -a parts <<< "$raw"
+  for item in "${parts[@]}"; do
+    clean="$(printf '%s' "$item" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$clean" ]] && continue
+    if ! is_valid_field "$clean"; then
+      echo "Error: invalid field '$clean'" >&2
+      exit 1
+    fi
+    if [[ ",$out," != *",$clean,"* ]]; then
+      out="${out:+$out,}$clean"
+    fi
+  done
+
+  if [[ -z "$out" ]]; then
+    echo "Error: --fields produced no valid fields" >&2
+    exit 1
+  fi
+
+  echo "$out"
+}
+
+field_selected() {
+  local field="$1"
+  [[ -z "$FIELDS_CANON" ]] && return 0
+  [[ ",$FIELDS_CANON," == *",$field,"* ]]
+}
+
+apply_fields_json() {
+  local obj="$1"
+  if [[ -z "$FIELDS_CANON" ]]; then
+    printf '%s\n' "$obj"
+    return 0
+  fi
+
+  echo "$obj" | jq --arg fields "$FIELDS_CANON" '
+    ($fields | split(",") | map(select(length > 0))) as $keep
+    | with_entries(select(.key as $k | $keep | index($k)))
+  '
+}
+
 query_one_ip_json() {
   local input="$1"
   local domain="$2"
   local ip="$3"
 
   local geo
-  geo="$(curl -fsS "http://ip-api.com/json/${ip}?lang=zh-CN")" || {
-    jq -cn --arg input "$input" --arg domain "$domain" --arg ip "$ip" --arg error "无法请求 ip-api" \
+  geo="$(curl -fsS --connect-timeout "$TIMEOUT" --max-time "$TIMEOUT" --retry "$RETRIES" "http://ip-api.com/json/${ip}?lang=${API_LANG}")" || {
+    jq -cn --arg input "$input" --arg domain "$domain" --arg ip "$ip" --arg error "$ERR_API_UNREACHABLE" \
       '{input:$input,domain:($domain|if .=="" then null else . end),ip:$ip,error:$error}'
     return 0
   }
@@ -127,7 +238,7 @@ query_one_ip_json() {
   status="$(echo "$geo" | jq -r '.status // empty')"
   if [[ "$status" != "success" ]]; then
     local msg
-    msg="$(echo "$geo" | jq -r '.message // "未知错误"')"
+    msg="$(echo "$geo" | jq -r --arg fallback "$ERR_UNKNOWN" '.message // $fallback')"
     jq -cn --arg input "$input" --arg domain "$domain" --arg ip "$ip" --arg error "$msg" \
       '{input:$input,domain:($domain|if .=="" then null else . end),ip:$ip,error:$error}'
     return 0
@@ -185,43 +296,30 @@ query_one_ip_json() {
 
 print_text_result() {
   local obj="$1"
+  local key val label
+  local order="domain ip country region city is_cn isp org as_text asn bgp_prefix bgp_cc input"
 
-  local domain ip country region city is_cn isp org as_text asn prefix
-  domain="$(echo "$obj" | jq -r '.domain // ""')"
-  ip="$(echo "$obj" | jq -r '.ip // ""')"
-  country="$(echo "$obj" | jq -r '.country // "-"')"
-  region="$(echo "$obj" | jq -r '.region // "-"')"
-  city="$(echo "$obj" | jq -r '.city // "-"')"
-  is_cn="$(echo "$obj" | jq -r '.is_cn')"
-  isp="$(echo "$obj" | jq -r '.isp // "-"')"
-  org="$(echo "$obj" | jq -r '.org // "-"')"
-  as_text="$(echo "$obj" | jq -r '.as_text // "-"')"
-  asn="$(echo "$obj" | jq -r '.asn // ""')"
-  prefix="$(echo "$obj" | jq -r '.bgp_prefix // ""')"
+  for key in $order; do
+    field_selected "$key" || continue
+    val="$(echo "$obj" | jq -r --arg k "$key" '.[$k] // empty')"
+    [[ -z "$val" || "$val" == "null" ]] && continue
+    [[ "$key" == "domain" && -z "$val" ]] && continue
 
-  if [[ -n "$domain" ]]; then
-    echo "域名      : $domain"
-  fi
-  echo "IP        : $ip"
-  echo "国家      : $country"
-  echo "省份      : $region"
-  echo "城市      : $city"
-  if [[ "$is_cn" == "true" ]]; then
-    echo "是否国内  : 是"
-  else
-    echo "是否国内  : 否"
-  fi
-  echo "ISP       : $isp"
-  echo "组织      : $org"
-  echo "AS(文本)  : $as_text"
+    if [[ "$key" == "is_cn" ]]; then
+      if [[ "$val" == "true" ]]; then
+        val="$TXT_YES"
+      else
+        val="$TXT_NO"
+      fi
+    fi
 
-  if [[ -n "$asn" ]]; then
-    echo "ASN       : AS$asn"
-  fi
+    if [[ "$key" == "asn" ]]; then
+      val="AS$val"
+    fi
 
-  if [[ -n "$prefix" ]]; then
-    echo "BGP前缀   : $prefix"
-  fi
+    label="$(field_label "$key")"
+    printf '%-10s: %s\n' "$label" "$val"
+  done
 }
 
 OUTPUT_JSON=0
@@ -229,6 +327,17 @@ ALL_IPS=0
 FAMILY="any"
 FORCE_V4=0
 FORCE_V6=0
+TIMEOUT=10
+RETRIES=1
+OUTPUT_LANG=""
+API_LANG="zh-CN"
+FIELDS_RAW=""
+FIELDS_CANON=""
+ERR_API_UNREACHABLE="无法请求 ip-api"
+ERR_UNKNOWN="未知错误"
+ERR_RESOLVE_FAILED="域名解析失败"
+TXT_YES="是"
+TXT_NO="否"
 INPUT_FILE=""
 declare -a TARGETS=()
 
@@ -241,6 +350,38 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    --lang)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --lang requires a value (zh|en)" >&2
+        exit 1
+      fi
+      OUTPUT_LANG="$2"
+      shift 2
+      ;;
+    --timeout)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ || "$2" -lt 1 ]]; then
+        echo "Error: --timeout requires a positive integer" >&2
+        exit 1
+      fi
+      TIMEOUT="$2"
+      shift 2
+      ;;
+    --retries)
+      if [[ $# -lt 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+        echo "Error: --retries requires a non-negative integer" >&2
+        exit 1
+      fi
+      RETRIES="$2"
+      shift 2
+      ;;
+    --fields)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: --fields requires a comma-separated list" >&2
+        exit 1
+      fi
+      FIELDS_RAW="$2"
+      shift 2
       ;;
     --json)
       OUTPUT_JSON=1
@@ -294,6 +435,37 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -z "$OUTPUT_LANG" ]]; then
+  OUTPUT_LANG="$(detect_lang)"
+fi
+
+case "$OUTPUT_LANG" in
+  zh)
+    API_LANG="zh-CN"
+    ERR_API_UNREACHABLE="无法请求 ip-api"
+    ERR_UNKNOWN="未知错误"
+    ERR_RESOLVE_FAILED="域名解析失败"
+    TXT_YES="是"
+    TXT_NO="否"
+    ;;
+  en)
+    API_LANG="en"
+    ERR_API_UNREACHABLE="failed to reach ip-api"
+    ERR_UNKNOWN="unknown error"
+    ERR_RESOLVE_FAILED="failed to resolve domain"
+    TXT_YES="yes"
+    TXT_NO="no"
+    ;;
+  *)
+    echo "Error: --lang must be zh or en" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -n "$FIELDS_RAW" ]]; then
+  FIELDS_CANON="$(normalize_fields "$FIELDS_RAW")"
+fi
 
 if [[ -n "$INPUT_FILE" ]]; then
   if [[ ! -f "$INPUT_FILE" ]]; then
@@ -354,7 +526,7 @@ for target in "${TARGETS[@]}"; do
     done < <(resolve_domain_ips "$domain" "$FAMILY" "$ALL_IPS" || true)
 
     if [[ ${#ips[@]} -eq 0 ]]; then
-      err="域名解析失败: $domain"
+      err="${ERR_RESOLVE_FAILED}: $domain"
       if [[ "$OUTPUT_JSON" -eq 1 ]]; then
         JSON_ROWS+=("$(jq -cn --arg input "$target" --arg domain "$domain" --arg error "$err" '{input:$input,domain:$domain,error:$error}')")
       else
@@ -368,9 +540,10 @@ for target in "${TARGETS[@]}"; do
   for ip in "${ips[@]}"; do
     obj="$(query_one_ip_json "$target" "$domain" "$ip")"
     has_error="$(echo "$obj" | jq -r 'has("error")')"
+    out_obj="$(apply_fields_json "$obj")"
 
     if [[ "$OUTPUT_JSON" -eq 1 ]]; then
-      JSON_ROWS+=("$obj")
+      JSON_ROWS+=("$out_obj")
     else
       if [[ "$has_error" == "true" ]]; then
         echo "$(echo "$obj" | jq -r '.error')" >&2
@@ -378,7 +551,7 @@ for target in "${TARGETS[@]}"; do
         if [[ "$printed" -eq 1 ]]; then
           echo
         fi
-        print_text_result "$obj"
+        print_text_result "$out_obj"
         printed=1
       fi
     fi
