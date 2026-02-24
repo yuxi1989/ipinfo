@@ -1,0 +1,141 @@
+name: Sync Homebrew Formula
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to sync (e.g. v0.2.1). Leave empty to use current ref tag.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: vars
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-}"
+          if [ -z "$tag" ]; then
+            tag="$REF_NAME"
+          fi
+          if [ -z "$tag" ]; then
+            echo "Unable to determine tag" >&2
+            exit 1
+          fi
+          case "$tag" in
+            v*) ;;
+            *)
+              echo "Tag must start with v, got: $tag" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "src_repo=${GITHUB_REPOSITORY}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release includes ipcn changes
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          prev_tag="$(git tag --list 'v*' --sort=-v:refname | grep -vx "$TAG" | head -n 1 || true)"
+          if [ -z "${prev_tag:-}" ]; then
+            echo "No previous version tag found, skip validation."
+            exit 0
+          fi
+
+          if git diff --quiet "${prev_tag}..${TAG}" -- ipcn; then
+            echo "Tag ${TAG} does not include changes to ipcn (compared with ${prev_tag})." >&2
+            echo "Refuse release to avoid empty Homebrew sync." >&2
+            exit 1
+          fi
+
+      - name: Download source tarball and compute sha256
+        id: digest
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+          SRC_REPO: ${{ steps.vars.outputs.src_repo }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${SRC_REPO}/archive/refs/tags/${TAG}.tar.gz"
+          curl -fL "$url" -o source.tar.gz
+          sha256="$(sha256sum source.tar.gz | awk '{print $1}')"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Clone tap repository
+        env:
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN || secrets.TOKEN }}
+          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'yuxi1989/homebrew-ipcn' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${HOMEBREW_TAP_GITHUB_TOKEN:-}" ]; then
+            echo "Missing secret HOMEBREW_TAP_GITHUB_TOKEN" >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/${HOMEBREW_TAP_REPO}.git" tap
+          default_branch="$(git -C tap symbolic-ref --short refs/remotes/origin/HEAD | sed 's#^origin/##')"
+          if [ -z "${default_branch:-}" ]; then
+            echo "Could not resolve tap default branch" >&2
+            exit 1
+          fi
+          echo "TAP_DEFAULT_BRANCH=${default_branch}" >> "$GITHUB_ENV"
+
+      - name: Update formula
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+          SRC_REPO: ${{ steps.vars.outputs.src_repo }}
+          ARCHIVE_URL: ${{ steps.digest.outputs.url }}
+          SHA256: ${{ steps.digest.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          formula=""
+          if [ -f tap/Formula/ipcn.rb ]; then
+            formula="tap/Formula/ipcn.rb"
+          elif [ -f tap/ipcn.rb ]; then
+            formula="tap/ipcn.rb"
+          else
+            echo "Could not find ipcn formula file in tap repository" >&2
+            exit 1
+          fi
+
+          perl -0777 -i -pe 's#url\s+"https://github.com/[^/]+/[^/]+/archive/refs/tags/v[^"]+\.tar\.gz"#url "'"${ARCHIVE_URL}"'"#g; s#sha256\s+"[0-9a-f]{64}"#sha256 "'"${SHA256}"'"#g' "$formula"
+
+          if ! grep -q "${TAG}.tar.gz" "$formula"; then
+            echo "Formula URL was not updated as expected" >&2
+            exit 1
+          fi
+
+      - name: Commit and push
+        env:
+          TAG: ${{ steps.vars.outputs.tag }}
+          HOMEBREW_TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO || 'yuxi1989/homebrew-ipcn' }}
+        run: |
+          set -euo pipefail
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "No formula changes detected."
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "Update ipcn formula to ${TAG}"
+          git push origin "HEAD:${TAP_DEFAULT_BRANCH}"

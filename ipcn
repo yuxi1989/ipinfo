@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_version() {
+  if [[ -n "${IPCN_VERSION:-}" ]]; then
+    echo "${IPCN_VERSION}"
+    return 0
+  fi
+
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  if command -v git >/dev/null 2>&1; then
+    if git -C "$script_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local tag
+      tag="$(git -C "$script_dir" describe --tags --abbrev=0 2>/dev/null || true)"
+      if [[ -n "$tag" ]]; then
+        echo "$tag"
+        return 0
+      fi
+    fi
+  fi
+
+  echo "unknown"
+}
+
+VERSION="$(resolve_version)"
+
+usage() {
+  cat <<'USAGE'
+Usage: ipcn [options] <IP-or-domain> [more targets...]
+
+Options:
+  -v, --version     Show version
+  -h, --help        Show help
+  --json            Output JSON array
+  -f, --file FILE   Read targets from file (one per line)
+  --all-ips         For domains, query all resolved A/AAAA records
+  --ipv4            Resolve/query IPv4 only
+  --ipv6            Resolve/query IPv6 only
+
+Examples:
+  ipcn 8.8.8.8
+  ipcn example.com
+  ipcn --all-ips example.com
+  ipcn --ipv6 --json example.com
+  ipcn -f targets.txt
+USAGE
+}
+
+require_cmd() {
+  local cmd="$1"
+  local hint="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Error: missing $cmd. $hint" >&2
+    exit 1
+  fi
+}
+
+# Basic check for IPv4/IPv6 input.
+is_ip() {
+  local s="$1"
+  [[ "$s" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && return 0
+  [[ "$s" =~ : ]] && return 0
+  return 1
+}
+
+resolve_domain_ips() {
+  local domain="$1"
+  local family="$2"
+  local all_ips="$3"
+  local -a ips=()
+  local line
+
+  if [[ "$family" == "4" || "$family" == "any" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && ips+=("$line")
+    done < <(dig +short A "$domain" || true)
+  fi
+
+  if [[ "$family" == "6" || "$family" == "any" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && ips+=("$line")
+    done < <(dig +short AAAA "$domain" || true)
+  fi
+
+  if [[ ${#ips[@]} -eq 0 ]]; then
+    return 1
+  fi
+
+  # Dedupe while preserving order (bash 3 compatible).
+  local -a uniq=()
+  local exists item
+  for line in "${ips[@]}"; do
+    exists=0
+    for item in "${uniq[@]:-}"; do
+      if [[ "$item" == "$line" ]]; then
+        exists=1
+        break
+      fi
+    done
+    if [[ "$exists" -eq 0 ]]; then
+      uniq+=("$line")
+    fi
+  done
+
+  if [[ "$all_ips" -eq 1 ]]; then
+    printf '%s\n' "${uniq[@]}"
+  else
+    printf '%s\n' "${uniq[0]}"
+  fi
+}
+
+query_one_ip_json() {
+  local input="$1"
+  local domain="$2"
+  local ip="$3"
+
+  local geo
+  geo="$(curl -fsS "http://ip-api.com/json/${ip}?lang=zh-CN")" || {
+    jq -cn --arg input "$input" --arg domain "$domain" --arg ip "$ip" --arg error "无法请求 ip-api" \
+      '{input:$input,domain:($domain|if .=="" then null else . end),ip:$ip,error:$error}'
+    return 0
+  }
+
+  local status
+  status="$(echo "$geo" | jq -r '.status // empty')"
+  if [[ "$status" != "success" ]]; then
+    local msg
+    msg="$(echo "$geo" | jq -r '.message // "未知错误"')"
+    jq -cn --arg input "$input" --arg domain "$domain" --arg ip "$ip" --arg error "$msg" \
+      '{input:$input,domain:($domain|if .=="" then null else . end),ip:$ip,error:$error}'
+    return 0
+  fi
+
+  local country region city isp org as_raw
+  country="$(echo "$geo" | jq -r '.country // "-"')"
+  region="$(echo "$geo" | jq -r '.regionName // "-"')"
+  city="$(echo "$geo" | jq -r '.city // "-"')"
+  isp="$(echo "$geo" | jq -r '.isp // "-"')"
+  org="$(echo "$geo" | jq -r '.org // "-"')"
+  as_raw="$(echo "$geo" | jq -r '.as // "-"')"
+
+  local cymru_line asn prefix bgp_cc cn
+  cymru_line="$(whois -h whois.cymru.com " -v ${ip}" 2>/dev/null | tail -n 1 || true)"
+  asn="$(echo "$cymru_line" | awk -F'|' '{gsub(/ /,"",$1); print $1}' | sed 's/^AS//')"
+  prefix="$(echo "$cymru_line" | awk -F'|' '{gsub(/^ +| +$/, "", $3); print $3}')"
+  bgp_cc="$(echo "$cymru_line" | awk -F'|' '{gsub(/^ +| +$/, "", $4); print $4}')"
+
+  cn="false"
+  if [[ "$country" == "中国" || "$bgp_cc" == "CN" ]]; then
+    cn="true"
+  fi
+
+  jq -cn \
+    --arg input "$input" \
+    --arg domain "$domain" \
+    --arg ip "$ip" \
+    --arg country "$country" \
+    --arg region "$region" \
+    --arg city "$city" \
+    --arg isp "$isp" \
+    --arg org "$org" \
+    --arg as_raw "$as_raw" \
+    --arg asn "$asn" \
+    --arg prefix "$prefix" \
+    --arg bgp_cc "$bgp_cc" \
+    --argjson is_cn "$cn" \
+    '{
+      input:$input,
+      domain:($domain|if .=="" then null else . end),
+      ip:$ip,
+      country:$country,
+      region:$region,
+      city:$city,
+      is_cn:$is_cn,
+      isp:$isp,
+      org:$org,
+      as_text:$as_raw,
+      asn:($asn|if .=="" then null else . end),
+      bgp_prefix:($prefix|if .=="" then null else . end),
+      bgp_cc:($bgp_cc|if .=="" then null else . end)
+    }'
+}
+
+print_text_result() {
+  local obj="$1"
+
+  local domain ip country region city is_cn isp org as_text asn prefix
+  domain="$(echo "$obj" | jq -r '.domain // ""')"
+  ip="$(echo "$obj" | jq -r '.ip // ""')"
+  country="$(echo "$obj" | jq -r '.country // "-"')"
+  region="$(echo "$obj" | jq -r '.region // "-"')"
+  city="$(echo "$obj" | jq -r '.city // "-"')"
+  is_cn="$(echo "$obj" | jq -r '.is_cn')"
+  isp="$(echo "$obj" | jq -r '.isp // "-"')"
+  org="$(echo "$obj" | jq -r '.org // "-"')"
+  as_text="$(echo "$obj" | jq -r '.as_text // "-"')"
+  asn="$(echo "$obj" | jq -r '.asn // ""')"
+  prefix="$(echo "$obj" | jq -r '.bgp_prefix // ""')"
+
+  if [[ -n "$domain" ]]; then
+    echo "域名      : $domain"
+  fi
+  echo "IP        : $ip"
+  echo "国家      : $country"
+  echo "省份      : $region"
+  echo "城市      : $city"
+  if [[ "$is_cn" == "true" ]]; then
+    echo "是否国内  : 是"
+  else
+    echo "是否国内  : 否"
+  fi
+  echo "ISP       : $isp"
+  echo "组织      : $org"
+  echo "AS(文本)  : $as_text"
+
+  if [[ -n "$asn" ]]; then
+    echo "ASN       : AS$asn"
+  fi
+
+  if [[ -n "$prefix" ]]; then
+    echo "BGP前缀   : $prefix"
+  fi
+}
+
+OUTPUT_JSON=0
+ALL_IPS=0
+FAMILY="any"
+FORCE_V4=0
+FORCE_V6=0
+INPUT_FILE=""
+declare -a TARGETS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--version)
+      echo "ipcn ${VERSION}"
+      exit 0
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --json)
+      OUTPUT_JSON=1
+      shift
+      ;;
+    --all-ips)
+      ALL_IPS=1
+      shift
+      ;;
+    --ipv4)
+      if [[ "$FORCE_V6" -eq 1 ]]; then
+        echo "Error: --ipv4 and --ipv6 cannot be used together" >&2
+        exit 1
+      fi
+      FAMILY="4"
+      FORCE_V4=1
+      shift
+      ;;
+    --ipv6)
+      if [[ "$FORCE_V4" -eq 1 ]]; then
+        echo "Error: --ipv4 and --ipv6 cannot be used together" >&2
+        exit 1
+      fi
+      FAMILY="6"
+      FORCE_V6=1
+      shift
+      ;;
+    -f|--file)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: $1 requires a file path" >&2
+        exit 1
+      fi
+      INPUT_FILE="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        TARGETS+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "Error: unknown option $1" >&2
+      usage
+      exit 1
+      ;;
+    *)
+      TARGETS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$INPUT_FILE" ]]; then
+  if [[ ! -f "$INPUT_FILE" ]]; then
+    echo "Error: file not found: $INPUT_FILE" >&2
+    exit 1
+  fi
+  while IFS= read -r line; do
+    line="$(printf '%s' "$line" | sed 's/#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -n "$line" ]] && TARGETS+=("$line")
+  done < "$INPUT_FILE"
+fi
+
+if [[ ${#TARGETS[@]} -eq 0 ]]; then
+  usage
+  exit 1
+fi
+
+require_cmd curl "Install with Homebrew: brew install curl"
+require_cmd jq "Install with Homebrew: brew install jq"
+require_cmd whois "Install with Homebrew if needed: brew install whois"
+require_cmd dig "Install with Homebrew if needed: brew install bind"
+
+declare -a JSON_ROWS=()
+printed=0
+failures=0
+
+for target in "${TARGETS[@]}"; do
+  declare -a ips=()
+  domain=""
+
+  if is_ip "$target"; then
+    # Respect family selector for direct IP input.
+    if [[ "$FAMILY" == "4" && "$target" == *:* ]]; then
+      err="IPv6 target skipped by --ipv4: $target"
+      if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+        JSON_ROWS+=("$(jq -cn --arg input "$target" --arg error "$err" '{input:$input,error:$error}')")
+      else
+        echo "$err" >&2
+      fi
+      failures=$((failures + 1))
+      continue
+    fi
+    if [[ "$FAMILY" == "6" && "$target" != *:* ]]; then
+      err="IPv4 target skipped by --ipv6: $target"
+      if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+        JSON_ROWS+=("$(jq -cn --arg input "$target" --arg error "$err" '{input:$input,error:$error}')")
+      else
+        echo "$err" >&2
+      fi
+      failures=$((failures + 1))
+      continue
+    fi
+    ips=("$target")
+  else
+    domain="$target"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && ips+=("$line")
+    done < <(resolve_domain_ips "$domain" "$FAMILY" "$ALL_IPS" || true)
+
+    if [[ ${#ips[@]} -eq 0 ]]; then
+      err="域名解析失败: $domain"
+      if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+        JSON_ROWS+=("$(jq -cn --arg input "$target" --arg domain "$domain" --arg error "$err" '{input:$input,domain:$domain,error:$error}')")
+      else
+        echo "$err" >&2
+      fi
+      failures=$((failures + 1))
+      continue
+    fi
+  fi
+
+  for ip in "${ips[@]}"; do
+    obj="$(query_one_ip_json "$target" "$domain" "$ip")"
+    has_error="$(echo "$obj" | jq -r 'has("error")')"
+
+    if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+      JSON_ROWS+=("$obj")
+    else
+      if [[ "$has_error" == "true" ]]; then
+        echo "$(echo "$obj" | jq -r '.error')" >&2
+      else
+        if [[ "$printed" -eq 1 ]]; then
+          echo
+        fi
+        print_text_result "$obj"
+        printed=1
+      fi
+    fi
+
+    if [[ "$has_error" == "true" ]]; then
+      failures=$((failures + 1))
+    fi
+  done
+done
+
+if [[ "$OUTPUT_JSON" -eq 1 ]]; then
+  printf '%s\n' "${JSON_ROWS[@]}" | jq -s '.'
+fi
+
+if [[ "$failures" -gt 0 ]]; then
+  exit 1
+fi
