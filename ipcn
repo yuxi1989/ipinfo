@@ -10,13 +10,27 @@ resolve_version() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+  # Homebrew install path: /opt/homebrew/Cellar/ipcn/<version>/bin
+  if [[ "$script_dir" == *"/Cellar/ipcn/"*"/bin" ]]; then
+    local cellar_ver
+    cellar_ver="${script_dir##*/Cellar/ipcn/}"
+    cellar_ver="${cellar_ver%%/bin*}"
+    if [[ -n "$cellar_ver" ]]; then
+      echo "v${cellar_ver}"
+      return 0
+    fi
+  fi
+
   if command -v git >/dev/null 2>&1; then
     if git -C "$script_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      local tag
-      tag="$(git -C "$script_dir" describe --tags --abbrev=0 2>/dev/null || true)"
-      if [[ -n "$tag" ]]; then
-        echo "$tag"
-        return 0
+      local origin_url tag
+      origin_url="$(git -C "$script_dir" remote get-url origin 2>/dev/null || true)"
+      if [[ "$origin_url" == *"yuxi1989/ipcn"* ]]; then
+        tag="$(git -C "$script_dir" describe --tags --abbrev=0 2>/dev/null || true)"
+        if [[ -n "$tag" ]]; then
+          echo "$tag"
+          return 0
+        fi
       fi
     fi
   fi

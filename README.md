@@ -57,7 +57,8 @@ git push --tags
 
 Version note:
 
-- `ipcn -v` will try to read the latest git tag automatically.
+- `ipcn -v` will read the latest git tag only when running inside the `yuxi1989/ipcn` git repository.
+- For Homebrew installs, `ipcn -v` reports the Cellar package version.
 - You can override it by setting `IPCN_VERSION`, e.g. `IPCN_VERSION=v0.2.5 ipcn -v`.
 
 ## Homebrew sync
